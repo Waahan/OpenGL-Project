@@ -4,6 +4,8 @@
 #include <fstream>
 #include <sstream>
 #include <memory>
+#include <algorithm>
+#include <chrono>
 
 #include <cstring>
 #include <cstdio>
@@ -17,6 +19,8 @@
 #include <GL/glext.h>
 
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
 
 struct XlibData
 {
@@ -32,6 +36,23 @@ struct XlibData
         XCloseDisplay(display);
     }
 };
+
+void disableCursor(XlibData& data)
+{
+    XGrabPointer(data.display, data.window, False, ButtonPressMask | ButtonReleaseMask | PointerMotionMask, GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
+
+    Cursor invisible;
+    {
+        char cursorData[1] = {0};
+        Pixmap mask = XCreateBitmapFromData(data.display, data.window, cursorData, 1, 1);
+        Pixmap pix = XCreateBitmapFromData(data.display, data.window, cursorData, 1, 1);
+        XColor dummy;
+        invisible = XCreatePixmapCursor(data.display, pix, mask, &dummy, &dummy, 0, 0);
+        XFreePixmap(data.display, pix);
+        XFreePixmap(data.display, mask);
+    }
+    XDefineCursor(data.display, data.window, invisible);
+}
 
 XlibData initXlibGlx()
 {
@@ -71,7 +92,7 @@ XlibData initXlibGlx()
 
     XSetWindowAttributes windowAttributes;
     windowAttributes.colormap = colormap;
-    windowAttributes.event_mask = ExposureMask | KeyPressMask | StructureNotifyMask;
+    windowAttributes.event_mask = ExposureMask | KeyPressMask | KeyReleaseMask | PointerMotionMask | StructureNotifyMask;
 
     data.window = XCreateWindow(data.display, rootWindow, 0, 0, 1920, 1080, 0, visual->depth, InputOutput, visual->visual, CWColormap | CWEventMask, &windowAttributes);
 
@@ -88,6 +109,8 @@ XlibData initXlibGlx()
     glXMakeCurrent(data.display, data.window, data.context);
 
     XFree(visual);
+
+    disableCursor(data);
 
     return data;
 }
@@ -119,6 +142,7 @@ PFNGLDELETEPROGRAMPROC glDeleteProgram = NULL;
 PFNGLGETUNIFORMLOCATIONPROC glGetUniformLocation = NULL;
 PFNGLUNIFORM4FPROC glUniform4f = NULL;
 PFNGLUNIFORM1IPROC glUniform1i = NULL;
+PFNGLUNIFORMMATRIX4FVPROC glUniformMatrix4fv = NULL;
 PFNGLBINDTEXTURESPROC glBindTextures = NULL;
 PFNGLGENERATEMIPMAPPROC glGenerateMipmap = NULL;
 
@@ -149,6 +173,7 @@ void loadOpenGLFunctions()
     LOAD_OPENGL_FUNCTION(glGetUniformLocation, PFNGLGETUNIFORMLOCATIONPROC);
     LOAD_OPENGL_FUNCTION(glUniform4f, PFNGLUNIFORM4FPROC);
     LOAD_OPENGL_FUNCTION(glUniform1i, PFNGLUNIFORM1IPROC);
+    LOAD_OPENGL_FUNCTION(glUniformMatrix4fv, PFNGLUNIFORMMATRIX4FVPROC);
     LOAD_OPENGL_FUNCTION(glBindTextures, PFNGLBINDTEXTURESPROC);
     LOAD_OPENGL_FUNCTION(glGenerateMipmap, PFNGLGENERATEMIPMAPPROC);
 }
@@ -273,11 +298,188 @@ std::tuple<unsigned char*, int, int> loadBMP(const char* filePath)
     return std::make_tuple(data, width, height);
 }
 
+struct
+{
+    bool shouldRun = true;
+
+    bool forward = false;
+    bool backward = false;
+    bool left = false;
+    bool right = false;
+
+    float lastX = 0.0f;
+    float lastY = 0.0f;
+    float windowWidth = 1920.0f;
+    float windowHeight = 1080.0f;
+    float pitch = 0.0f;
+    float yaw = -90.0f;
+
+    void(*mouseRelativeMotion)(float, float);
+    void(*windowResize)(float, float);
+} Input;
+
+void linuxProcessInput(XlibData& xorg)
+{
+    XEvent event;
+    while(XPending(xorg.display))
+    {
+        XNextEvent(xorg.display, &event);
+        switch(event.type)
+        {
+            case ClientMessage:
+                if((Atom)event.xclient.data.l[0] == xorg.deleteWindowMessage)
+                    Input.shouldRun = false;
+                break;
+
+            case ConfigureNotify:
+                {
+                    XConfigureEvent* configureNotifyEvent = (XConfigureEvent*)&event;
+
+                    Input.windowWidth = configureNotifyEvent->width;
+                    Input.windowHeight = configureNotifyEvent->height;
+
+                    Input.windowResize(configureNotifyEvent->width, configureNotifyEvent->height);
+                }
+                break;
+
+            case KeyPress:
+                {
+                    XKeyEvent* keyPressEvent = (XKeyEvent*)&event;
+                    if(keyPressEvent->keycode == XKeysymToKeycode(xorg.display, XK_Escape))
+                        Input.shouldRun = false;
+                    else if(keyPressEvent->keycode == XKeysymToKeycode(xorg.display, XK_W))
+                        Input.forward = true;
+                    else if(keyPressEvent->keycode == XKeysymToKeycode(xorg.display, XK_S))
+                        Input.backward = true;
+                    else if(keyPressEvent->keycode == XKeysymToKeycode(xorg.display, XK_A))
+                        Input.left = true;
+                    else if(keyPressEvent->keycode == XKeysymToKeycode(xorg.display, XK_D))
+                        Input.right = true;
+                }
+                break;
+
+            case KeyRelease:
+                {
+                    XKeyEvent* keyPressEvent = (XKeyEvent*)&event;
+                    if(keyPressEvent->keycode == XKeysymToKeycode(xorg.display, XK_W))
+                        Input.forward = false;
+                    else if(keyPressEvent->keycode == XKeysymToKeycode(xorg.display, XK_S))
+                        Input.backward = false;
+                    else if(keyPressEvent->keycode == XKeysymToKeycode(xorg.display, XK_A))
+                        Input.left = false;
+                    else if(keyPressEvent->keycode == XKeysymToKeycode(xorg.display, XK_D))
+                        Input.right = false;
+                }
+                break;
+
+            case MotionNotify:
+                {
+                    XMotionEvent* motionEvent = (XMotionEvent*)&event;
+
+                    float xoffset = motionEvent->x - Input.lastX;
+                    float yoffset = Input.lastY - motionEvent->y;
+
+                    Input.lastX = motionEvent->x;
+                    Input.lastY = motionEvent->y;
+
+                    Input.mouseRelativeMotion(xoffset, yoffset);
+                }
+                break;
+        }
+    }
+    XWarpPointer(xorg.display, None, xorg.window, 0, 0, 0, 0, Input.windowWidth / 2, Input.windowHeight / 2);
+    Input.lastX = Input.windowWidth / 2;
+    Input.lastY = Input.windowHeight / 2;
+}
+
+struct
+{
+    std::chrono::time_point<std::chrono::steady_clock> lastTime;
+    float deltaTime = 0.0f;
+} GameTime;
+
+void updateTime()
+{
+    std::chrono::time_point<std::chrono::steady_clock> currentTime = std::chrono::steady_clock::now();
+    GameTime.deltaTime = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - GameTime.lastTime).count() * 0.001f;
+    GameTime.lastTime = currentTime;
+}
+
+struct
+{
+    glm::vec3 position = glm::vec3{0.0f, 0.0f, 3.0f};
+    glm::vec3 front = glm::vec3{0.0f, 0.0f, -1.0f};
+    glm::vec3 up = glm::vec3{0.0f, 1.0f, 0.0f};
+    const float FOV = 45.0f;
+
+    glm::mat4 view;
+    glm::mat4 projection;
+} Camera;
+
+void processInput()
+{
+    float cameraSpeed = 5.0f * GameTime.deltaTime;
+
+    if(Input.forward)
+        Camera.position += cameraSpeed * Camera.front;
+
+    if(Input.backward)
+        Camera.position -= cameraSpeed * Camera.front;
+
+    if(Input.left)
+        Camera.position -= glm::normalize(glm::cross(Camera.front, Camera.up)) * cameraSpeed;
+
+    if(Input.right)
+        Camera.position += glm::normalize(glm::cross(Camera.front, Camera.up)) * cameraSpeed;
+}
+
+void inputMouseCamera(float xoffset, float yoffset)
+{
+    const constexpr float sensitivity = 0.05f;
+
+    xoffset *= sensitivity;
+    yoffset *= sensitivity;
+
+    Input.yaw += xoffset;
+    Input.pitch += yoffset;
+
+    Input.pitch = std::clamp(Input.pitch, -89.0f, 89.0f);
+
+    glm::vec3 direction;
+    direction.x = cos(glm::radians(Input.yaw)) * cos(glm::radians(Input.pitch));
+    direction.y = sin(glm::radians(Input.pitch));
+    direction.z = sin(glm::radians(Input.yaw)) * cos(glm::radians(Input.pitch));
+    Camera.front = glm::normalize(direction);
+}
+
+void windowResizeEvent(float width, float height)
+{
+    glViewport(0, 0, width, height);
+    Camera.projection = glm::perspective(glm::radians(Camera.FOV), width / height, 0.1f, 100.0f);
+}
+
+// For testing purposes only
+void fpsCounter()
+{
+    static std::chrono::time_point<std::chrono::steady_clock> lastTime = std::chrono::steady_clock::now();
+    static double frames = 0;
+
+    frames++;
+    if(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - lastTime).count() >= 1.0f)
+    {
+        std::println("FPS: {}, {} milliseconds per frame", frames, 1000.0/frames);
+        frames = 0;
+        lastTime = std::chrono::steady_clock::now();
+    }
+}
+
 int main(int, char**)
 {
     XlibData xorg = initXlibGlx();
 
     loadOpenGLFunctions();
+
+    glEnable(GL_DEPTH_TEST);
 
     std::println("OpenGL Vendor: {}", (const char*)glGetString(GL_VENDOR));
     std::println("OpenGL Renderer: {}", (const char*)glGetString(GL_RENDERER));
@@ -290,15 +492,36 @@ int main(int, char**)
     glUniform1i(glGetUniformLocation(shaderProgram, "otherTexture"), 1);
 
     float vertices[] = {
-        // positions          // colors           // texture coords
-        0.5f,  0.5f, 0.0f,   1.0f, 0.0f, 0.0f,   1.0f, 1.0f,   // top right
-        0.5f, -0.5f, 0.0f,   0.0f, 1.0f, 0.0f,   1.0f, 0.0f,   // bottom right
-        -0.5f, -0.5f, 0.0f,   0.0f, 0.0f, 1.0f,   0.0f, 0.0f,   // bottom left
-        -0.5f,  0.5f, 0.0f,   1.0f, 1.0f, 0.0f,   0.0f, 1.0f    // top left
+        -0.5f, -0.5f, -0.5f,  0.0f, 0.0f, // 0
+         0.5f, -0.5f, -0.5f,  1.0f, 0.0f, // 1
+         0.5f,  0.5f, -0.5f,  1.0f, 1.0f, // 2
+        -0.5f,  0.5f, -0.5f,  0.0f, 1.0f, // 3
+        -0.5f, -0.5f,  0.5f,  0.0f, 0.0f, // 4
+         0.5f, -0.5f,  0.5f,  1.0f, 0.0f, // 5
+         0.5f,  0.5f,  0.5f,  1.0f, 1.0f, // 6
+        -0.5f,  0.5f,  0.5f,  0.0f, 1.0f, // 7
+        -0.5f,  0.5f,  0.5f,  1.0f, 0.0f, // 8
+        -0.5f, -0.5f, -0.5f,  0.0f, 1.0f, // 9
+         0.5f,  0.5f,  0.5f,  1.0f, 0.0f, // 10
+         0.5f, -0.5f, -0.5f,  0.0f, 1.0f, // 11
+         0.5f, -0.5f,  0.5f,  0.0f, 0.0f, // 12
+         0.5f, -0.5f, -0.5f,  1.0f, 1.0f, // 13
+        -0.5f,  0.5f,  0.5f,  0.0f, 0.0f, // 14
+        -0.5f,  0.5f, -0.5f,  1.0f, 1.0f, // 15
     };
     unsigned int indices[] = {
-        0, 1, 3,
-        1, 2, 3,
+        0, 1, 2,
+        2, 3, 0,
+        4, 5, 6,
+        6, 7, 4,
+        8, 15, 9,
+        9, 4, 8,
+        10, 2, 11,
+        11, 12, 10,
+        9, 13, 5,
+        5, 4, 9,
+        3, 2, 10,
+        10, 14, 3,
     };
 
     unsigned int VBO, VAO, EBO;
@@ -313,14 +536,11 @@ int main(int, char**)
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, EBO);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
 
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
     glEnableVertexAttribArray(0);
 
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
     glEnableVertexAttribArray(1);
-
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
-    glEnableVertexAttribArray(2);
 
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindVertexArray(0);
@@ -359,39 +579,46 @@ int main(int, char**)
         delete data;
     }
 
-    bool shouldRun = true;
-    while(shouldRun)
+    glm::vec3 cubePositions[] = {
+        glm::vec3( 0.0f,  0.0f,  0.0f),
+        glm::vec3( 2.0f,  5.0f, -15.0f),
+        glm::vec3(-1.5f, -2.2f, -2.5f),
+        glm::vec3(-3.8f, -2.0f, -12.3f),
+        glm::vec3( 2.4f, -0.4f, -3.5f),
+        glm::vec3(-1.7f,  3.0f, -7.5f),
+        glm::vec3( 1.3f, -2.0f, -2.5f),
+        glm::vec3( 1.5f,  2.0f, -2.5f),
+        glm::vec3( 1.5f,  0.2f, -1.5f),
+        glm::vec3(-1.3f,  1.0f, -1.5f)
+    };
+
+    Camera.view = glm::lookAt(Camera.position, Camera.position + Camera.front, Camera.up);
+    Camera.projection = glm::perspective(glm::radians(Camera.FOV), Input.windowWidth / Input.windowHeight, 0.1f, 100.0f);
+
+    Input.mouseRelativeMotion = inputMouseCamera;
+    Input.windowResize = windowResizeEvent;
+
+    float angle = 0.0f;
+
+    while(Input.shouldRun)
     {
-        XEvent event;
-        while(XPending(xorg.display))
-        {
-            XNextEvent(xorg.display, &event);
-            switch(event.type)
-            {
-                case ClientMessage:
-                    if((Atom)event.xclient.data.l[0] == xorg.deleteWindowMessage)
-                        shouldRun = false;
-                    break;
+        //fpsCounter();
 
-                case ConfigureNotify:
-                    {
-                        XConfigureEvent* configureNotifyEvent = (XConfigureEvent*)&event;
-                        glViewport(0, 0, configureNotifyEvent->width, configureNotifyEvent->height);
-                    }
-                    break;
+        //std::chrono::time_point<std::chrono::high_resolution_clock> frameBeginTime = std::chrono::high_resolution_clock::now();
 
-                case KeyPress:
-                    {
-                        XKeyEvent* keyPressEvent = (XKeyEvent*)&event;
-                        if(keyPressEvent->keycode == XKeysymToKeycode(xorg.display, XK_Escape))
-                            shouldRun = false;
-                    }
-                    break;
-            }
-        }
+        updateTime();
+
+        linuxProcessInput(xorg);
+        processInput();
+
+        Camera.view = glm::lookAt(Camera.position, Camera.position + Camera.front, Camera.up);
+
+        glUseProgram(shaderProgram);
+        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(Camera.view));
+        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(Camera.projection));
 
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
         glUseProgram(shaderProgram);
         glBindVertexArray(VAO);
@@ -399,7 +626,19 @@ int main(int, char**)
         glBindTexture(GL_TEXTURE_2D, texture);
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, texture2);
-        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+
+        angle += 20 * GameTime.deltaTime;
+
+        for(int i = 0; i < 10; i++)
+        {
+            glm::mat4 currentModel = glm::mat4(1.0f);
+            currentModel = glm::translate(currentModel, cubePositions[i]);
+            currentModel = glm::rotate(currentModel, glm::radians(5.0f * angle), glm::vec3(1.0f, 1.0f, 1.0f));
+            glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, glm::value_ptr(currentModel));
+            glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_INT, 0);
+        }
+
+        //std::println("Frame took {} milliseconds", std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - frameBeginTime).count() * 0.000001f);
 
         glXSwapBuffers(xorg.display, xorg.window);
     }
